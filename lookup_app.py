@@ -9,6 +9,17 @@ import streamlit as st
 st.set_page_config(page_title="Sales Lookup — Perfume Pricebook", layout="wide")
 st.title("🧾 Sales Lookup — Perfume Pricebook")
 st.caption("Build: sales-lookup v1.2")
+# ---- Globals / policy ----
+BC_MIN_LEN = 8
+FUZZY_THRESHOLD_DEFAULT = 91
+
+# --- constants / helpers ---
+def normalize_digits(x):
+    import re as _re
+    import pandas as _pd
+    if x is None or (isinstance(x, float) and _pd.isna(x)):
+        return ""
+    return _re.sub(r"\D", "", str(x))
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -27,13 +38,34 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             out[c] = pd.NA
     return out
 
-
 def normalize_barcode(val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     s = str(val)
     digits = re.sub(r"\D", "", s)
     return digits or None
+
+# --- Barcode helpers (paste after normalize_barcode) ---
+BC_MIN_LEN = 8  # treat 8+ digit strings as barcodes
+
+def detect_barcode_col(cols: list[str]) -> str | None:
+    """
+    Return the first column name that looks like a barcode field.
+    Match is case/space-insensitive.
+    """
+    candidates = [
+        "barcode", "bar code", "ean", "ean13", "upc", "gtin",
+        "sku_barcode", "sku barcode", "code", "product code"
+    ]
+    low = {str(c).lower().strip(): c for c in cols}
+    for k in candidates:
+        if k in low:
+            return low[k]
+    return None
+
+def digits_only(x):
+    import re
+    return re.sub(r"\D", "", str(x)) if x is not None else ""
 
 @st.cache_data(show_spinner=False)
 def load_pricebook_upload(file) -> tuple[pd.DataFrame | None, str | None]:
@@ -46,6 +78,12 @@ def load_pricebook_upload(file) -> tuple[pd.DataFrame | None, str | None]:
 
     # Read bytes once
     try:
+        # reset stream if possible (avoid empty reads on repeated calls)
+        if hasattr(file, "seek"):
+            try:
+                file.seek(0)
+            except Exception:
+                pass
         raw = file.read()
     except Exception as e:
         return None, f"Could not read upload buffer: {e!r}"
@@ -56,36 +94,49 @@ def load_pricebook_upload(file) -> tuple[pd.DataFrame | None, str | None]:
 
     preferred_sheets = ["pricebook", "sheet1", "export", "priced", "data"]
 
-    # 1) Excel first (needs openpyxl)
+    # 1) Excel first (let pandas auto-select engine for .xlsx/.xls)
     excel_err = None
     looks_like_xlsx = name.endswith((".xlsx", ".xls")) or (len(raw) >= 4 and raw[:2] == b"PK")
     if looks_like_xlsx:
         try:
             b.seek(0)
-            xls = pd.ExcelFile(b, engine="openpyxl")
+            xls = pd.ExcelFile(b)  # let pandas pick engine (openpyxl/xlrd)
             lower_names = {s.lower(): s for s in xls.sheet_names}
             sheet = next((lower_names[cand] for cand in preferred_sheets if cand in lower_names), None)
-            df = xls.parse(sheet_name=sheet or 0)
+            df = xls.parse(sheet_name=sheet or 0, dtype=str)
             return df, None
+        except ImportError as e:
+            # Missing engine (e.g., openpyxl) — give a clear, actionable error
+            excel_err = "Missing optional dependency 'openpyxl'. Please install it: pip install openpyxl"
         except Exception as e:
             excel_err = f"Excel open failed: {e!r}"
 
-    # 2) CSV encodings
-    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin1", "cp1256"):
-        try:
-            b.seek(0)
-            df = pd.read_csv(_io.BytesIO(raw), encoding=enc)
-            return df, None
-        except Exception:
-            continue
+    # 2) CSV encodings (only attempt if filename suggests CSV)
+    csv_err = None
+    if name.endswith(".csv") or not looks_like_xlsx:
+        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin1", "cp1256"):
+            try:
+                b.seek(0)
+                # Try robust CSV read with python engine and sep inference
+                df = pd.read_csv(_io.BytesIO(raw), encoding=enc, engine="python", sep=None, dtype=str)
+                return df, None
+            except Exception:
+                try:
+                    b.seek(0)
+                    df = pd.read_csv(_io.BytesIO(raw), encoding=enc, dtype=str)
+                    return df, None
+                except Exception as e:
+                    csv_err = f"CSV read failed: {e!r}"
 
     # 3) Fallback: decode bytes ourselves (so no errors= kwarg is needed)
     try:
-        txt = raw.decode("utf-8", errors="replace")
-        df = pd.read_csv(_io.StringIO(txt))
-        return df, None
+        if name.endswith(".csv") or not looks_like_xlsx:
+            txt = raw.decode("utf-8", errors="replace")
+            df = pd.read_csv(_io.StringIO(txt), engine="python", sep=None, dtype=str)
+            return df, None
     except Exception as e:
-        csv_err = f"CSV read failed: {e!r}"
+        if name.endswith(".csv") or not looks_like_xlsx:
+            csv_err = f"CSV read failed: {e!r}"
     else:
         csv_err = None
 
@@ -119,7 +170,61 @@ def fuzzy_top_k(query: str, choices: list, k: int = 5):
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Load Pricebook")
-    pb_up = st.file_uploader("Upload Pricebook (Excel/CSV)", type=["xlsx","xls","csv"])
+    pb_up = st.file_uploader("Upload Pricebook (Excel or CSV)", type=["xlsx","xls","csv"])
+
+    df_pb, err = load_pricebook_upload(pb_up) if pb_up else (None, None)
+    if pb_up and (df_pb is None or isinstance(df_pb, pd.DataFrame) and df_pb.empty):
+        st.error(err or "Could not read the file. Make sure it’s an Excel (.xlsx/.xls) or CSV.")
+        st.stop()
+
+    def _prep_pricebook(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        if "name" not in out.columns:
+            if "product" in out.columns:
+                out.rename(columns={"product": "name"}, inplace=True)
+            else:
+                out["name"] = pd.NA
+        # Map common barcode aliases to a canonical 'barcode' column
+        low = {str(c).lower().strip(): c for c in out.columns}
+        if "barcode" not in out.columns:
+            alias = None
+            for cand in ["barcode", "bar code", "ean", "ean13", "gtin", "upc"]:
+                if cand in low:
+                    alias = low[cand]
+                    break
+            if alias is not None:
+                out["barcode"] = out[alias]
+            else:
+                out["barcode"] = ""
+        # Build normalized barcode
+        out["barcode_norm"] = out["barcode"].apply(normalize_digits)
+        for c in [
+            "recommended_price", "cost_aed", "min_market", "max_market",
+            "price_slow_sales", "price_fast_premium",
+            "below_cost_flag", "cost_gap_flag", "size_ml", "is_tester",
+            "product_id"
+        ]:
+            if c not in out.columns:
+                out[c] = pd.NA
+        out["size_ml"] = pd.to_numeric(out["size_ml"], errors="coerce")
+        out["is_tester"] = out["is_tester"].astype(str).str.lower().isin(["1","true","yes","y","t"])
+        return out
+
+    if pb_up and isinstance(df_pb, pd.DataFrame):
+        prepped = _prep_pricebook(df_pb)
+        st.session_state["pricebook"] = prepped
+        # Normalize barcodes once on load and ensure name exists
+        pb_norm = st.session_state.get("pricebook")
+        if pb_norm is not None and not pb_norm.empty:
+            pb_norm = pb_norm.copy()
+            if "barcode_norm" not in pb_norm.columns:
+                if "barcode" not in pb_norm.columns:
+                    pb_norm["barcode"] = ""
+                pb_norm["barcode_norm"] = pb_norm["barcode"].apply(normalize_digits)
+            if "name" not in pb_norm.columns:
+                pb_norm["name"] = pb_norm["product"] if "product" in pb_norm.columns else ""
+            st.session_state["pricebook"] = pb_norm
+        st.dataframe(st.session_state["pricebook"].head(20), use_container_width=True)
 
     col_save, col_clear = st.columns(2)
     with col_save:
@@ -128,29 +233,27 @@ with st.sidebar:
         clear_btn = st.button("Clear")
 
     if save_btn:
-        if pb_up is None:
+        if not pb_up:
             st.error("Please choose a file first.")
         else:
             df_pb, err = load_pricebook_upload(pb_up)
             if df_pb is None or df_pb.empty:
                 st.error(err or "Could not read the file. Use Excel .xlsx/.xls or CSV.")
                 st.stop()
-            else:
-                df_pb = ensure_columns(df_pb)
-
-                # normalize flags to booleans
-                for col in ["cost_gap_flag", "below_cost_flag"]:
-                    if col not in df_pb.columns:
-                        df_pb[col] = False
-                df_pb["cost_gap_flag"] = df_pb["cost_gap_flag"].fillna(False).astype(bool)
-                df_pb["below_cost_flag"] = df_pb["below_cost_flag"].fillna(False).astype(bool)
-
-                # normalize barcode to digits only (string)
-                if "barcode" in df_pb.columns:
-                    df_pb["barcode"] = df_pb["barcode"].apply(normalize_barcode)
-
-                st.session_state["pricebook"] = df_pb
-                st.success(f"Loaded Pricebook: {df_pb.shape[0]} rows")
+            prepped = _prep_pricebook(df_pb)
+            st.session_state["pricebook"] = prepped
+            # Normalize barcodes once on load and ensure name exists
+            pb_norm = st.session_state.get("pricebook")
+            if pb_norm is not None and not pb_norm.empty:
+                pb_norm = pb_norm.copy()
+                if "barcode_norm" not in pb_norm.columns:
+                    if "barcode" not in pb_norm.columns:
+                        pb_norm["barcode"] = ""
+                    pb_norm["barcode_norm"] = pb_norm["barcode"].apply(normalize_digits)
+                if "name" not in pb_norm.columns:
+                    pb_norm["name"] = pb_norm["product"] if "product" in pb_norm.columns else ""
+                st.session_state["pricebook"] = pb_norm
+            st.success(f"Loaded Pricebook: {prepped.shape[0]} rows")
 
     if clear_btn:
         st.session_state.pop("pricebook", None)
@@ -177,18 +280,20 @@ else:
 
     # Search
     if query:
-        digits_only = re.sub(r"\D", "", query or "")
+        q_digits = re.sub(r"\D", "", query or "")
         results_df = None
 
-        # 1) Barcode-first if 8+ digits present
-        if digits_only and len(digits_only) >= 8 and "barcode" in pricebook.columns:
-            mask = pricebook["barcode"].astype(str).str.contains(digits_only, na=False)
+        # 1) Barcode-first if 8+ digits present (strict: no fuzzy fallback if present but no match)
+        if q_digits and len(q_digits) >= BC_MIN_LEN and "barcode_norm" in pricebook.columns:
+            mask = pricebook["barcode_norm"].astype(str).str.contains(q_digits, na=False)
             bc_hits = pricebook[mask].copy()
             if not bc_hits.empty:
                 results_df = bc_hits.head(int(top_n))
+            else:
+                results_df = pd.DataFrame()  # explicit no-fuzzy when barcode provided but fails
 
-        # 2) Fuzzy name fallback
-        if results_df is None or results_df.empty:
+        # 2) Fuzzy name fallback ONLY if no usable barcode in query
+        if (not q_digits or len(q_digits) < BC_MIN_LEN) and (results_df is None or results_df.empty):
             names = pricebook["name"].fillna("").astype(str).tolist()
             idx_scores = fuzzy_top_k(query, names, k=int(top_n))
             if idx_scores:
@@ -353,84 +458,95 @@ else:
         run_bulk = st.button("Create detailed quote")
 
         # strict matcher used in both tabs
-        def match_one_strict(row_like: dict):
+        def match_one_strict(row: dict):
             """
-            Barcode-first (>=8 digits) with NO fuzzy fallback if barcode given.
-            Else fuzzy name match within same size/tester when possible.
-            Returns matched pricebook row (Series) or None.
+            Barcode-first (exact/contains on normalized digits) with NO fuzzy fallback
+            if a usable barcode was provided. Only when there's no usable barcode do we
+            fuzzy match by name (threshold ≥ 91 by default).
             """
-            # Build narrowed PB frame
-            pb = pricebook
+            pb = st.session_state.get("pricebook")
+            if pb is None or pb.empty:
+                return None
 
-            # If caller passed explicit size/tester, pre-filter
-            base = pb
-            r_size = row_like.get("size_ml")
-            r_tester = row_like.get("is_tester")
+            # pull normalized barcode (prefer provided barcode_norm; else normalize barcode)
+            bc = normalize_digits(row.get("barcode_norm", row.get("barcode", ""))).strip()
+            name = str(row.get("name", "")).strip()
 
-            if r_size is not None and not pd.isna(r_size) and "size_ml" in base.columns:
+            # 1) Barcode path (no fuzzy fallback if barcode exists but doesn't match)
+            if bc and len(bc) >= BC_MIN_LEN and "barcode_norm" in pb.columns:
+                # Prefer exact match on normalized digits; else allow substring for partial scans
+                exact_hits = pb[pb["barcode_norm"].astype(str) == bc]
+                if not exact_hits.empty:
+                    return exact_hits.iloc[0].to_dict()
+                contains_hits = pb[pb["barcode_norm"].astype(str).str.contains(bc, na=False)]
+                if not contains_hits.empty:
+                    return contains_hits.iloc[0].to_dict()
+                return None  # barcode present but no match → do NOT fuzzy
+
+            # 2) Fuzzy fallback ONLY if no usable barcode was provided
+            names = pb["name"].fillna("").astype(str).tolist()
+            if name:
                 try:
-                    base = base[base["size_ml"] == float(r_size)]
+                    from rapidfuzz import process, fuzz
+                    hit = process.extractOne(name, names, scorer=fuzz.WRatio)
+                    if hit is not None:
+                        choice, score, idx = hit
+                        if score >= int(st.session_state.get("FUZZY_THRESHOLD", 91)):
+                            return pb.iloc[idx].to_dict()
                 except Exception:
-                    pass
-            if r_tester is not None and "is_tester" in base.columns:
-                base = base[base["is_tester"] == bool(r_tester)]
+                    import difflib
+                    hits = difflib.get_close_matches(name, names, n=1, cutoff=0.0)
+                    if hits:
+                        return pb[pb["name"].astype(str) == hits[0]].iloc[0].to_dict()
 
-            # Barcode-first
-            bc = _digits(row_like.get("barcode"))
-            if bc and len(bc) >= 8:
-                hits = base[base["barcode_str"] == bc]
-                if not hits.empty:
-                    return hits.iloc[0]
-                # STRICT: do not fall back if barcode provided
-                return None
-
-            # Fuzzy by name
-            qname = str(row_like.get("name") or "").strip()
-            if not qname:
-                return None
-            # search within base but using original name column for scoring
-            base_names = base[["product_id","name","name_key","size_ml","is_tester","recommended_price","cost_aed","min_market","max_market","barcode_str"]].copy()
-            if base_names.empty:
-                return None
-            base_names["search_name"] = base_names["name_key"]  # use a unique scoring column
-            return _fuzzy_top1(qname.upper(), base_names, name_col="search_name")
+            return None
 
         if run_bulk:
             input_rows = []
 
             # File path
             if bulk_file is not None:
+                # Read customer list (preserve barcodes as text)
                 try:
                     try:
-                        df_in = pd.read_excel(bulk_file)
+                        df_in = pd.read_excel(bulk_file, dtype=str)
                     except Exception:
                         bulk_file.seek(0)
-                        df_in = pd.read_csv(bulk_file)
-                    cols = {c.lower(): c for c in df_in.columns}
-                    name_col = cols.get("name") or cols.get("product") or list(df_in.columns)[0]
-                    qty_col  = cols.get("qty") or cols.get("quantity")
-                    bc_col   = cols.get("barcode")
-                    size_col = cols.get("size_ml") or cols.get("ml") or cols.get("size")
-                    tst_col  = cols.get("is_tester") or cols.get("tester")
-
-                    for _, r in df_in.iterrows():
-                        rec = {
-                            "name": str(r.get(name_col, "")),
-                            "qty": int(r.get(qty_col, 1)) if qty_col in df_in.columns else 1,
-                            "barcode": str(r.get(bc_col, "")) if bc_col else "",
-                            "size_ml": pd.to_numeric(r.get(size_col), errors="coerce") if size_col else None,
-                            "is_tester": str(r.get(tst_col, "")).strip().lower() in ("1","true","yes","y","t") if tst_col else None,
-                        }
-                        input_rows.append(rec)
+                        df_in = pd.read_csv(bulk_file, dtype=str)
                 except Exception as e:
                     st.error(f"Could not read file: {e}")
+                    st.stop()
+
+                # Normalize headers
+                cols_low = {str(c).strip().lower(): c for c in df_in.columns}
+                name_col = cols_low.get("name") or cols_low.get("product") or list(df_in.columns)[0]
+                bc_col   = cols_low.get("barcode") or cols_low.get("bar code") or cols_low.get("ean") or cols_low.get("upc")
+                qty_col  = cols_low.get("qty") or cols_low.get("quantity")
+
+                # Build input rows with normalized barcode
+                input_rows = []
+                for _, r in df_in.iterrows():
+                    raw_name = str(r.get(name_col, "")).strip() if name_col else ""
+                    raw_bc   = str(r.get(bc_col, "")).strip() if bc_col else ""
+                    qty_val  = r.get(qty_col, "1")
+                    try:
+                        qty_num = int(float(qty_val)) if qty_val not in (None, "", "nan") else 1
+                    except Exception:
+                        qty_num = 1
+
+                    input_rows.append({
+                        "name": raw_name,
+                        "barcode": raw_bc,
+                        "barcode_norm": normalize_digits(raw_bc),
+                        "qty": max(qty_num, 1),
+                    })
 
             # Paste path
             if not input_rows and pasted.strip():
                 for line in pasted.splitlines():
                     name, q = parse_qty_and_query(line)
                     if name:
-                        input_rows.append({"name": name, "qty": q, "barcode": "", "size_ml": None, "is_tester": None})
+                        input_rows.append({"name": name, "qty": q, "barcode_norm": "", "size_ml": None, "is_tester": None})
 
             if not input_rows:
                 st.warning("No items provided. Paste a list or upload a file.")
@@ -438,8 +554,8 @@ else:
                 out_rows, misses = [], []
                 for item in input_rows:
                     hit = match_one_strict(item)
-                    if hit is None or hit.empty:
-                        misses.append({"input": item.get("name") or item.get("barcode"), "qty": item.get("qty")})
+                    if hit is None:
+                        misses.append({"input": item.get("name") or item.get("barcode_norm"), "qty": item.get("qty")})
                         continue
 
                     recf = pd.to_numeric(hit.get("recommended_price"), errors="coerce")
@@ -449,12 +565,12 @@ else:
                     total= float(recf) * float(item["qty"]) if pd.notna(recf) else None
 
                     out_rows.append({
-                        "input": item.get("name") or item.get("barcode"),
+                        "input": item.get("name") or item.get("barcode_norm"),
                         "qty": item["qty"],
                         "matched_name": hit.get("name"),
                         "product_id": hit.get("product_id"),
                         "size_ml": hit.get("size_ml"),
-                        "barcode": hit.get("barcode_str"),
+                        "barcode": hit.get("barcode"),
                         "recommended_price": float(recf) if pd.notna(recf) else pd.NA,
                         "cost_aed": float(costf) if pd.notna(costf) else pd.NA,
                         "min_market": float(mnf) if pd.notna(mnf) else pd.NA,
@@ -477,7 +593,6 @@ else:
                     st.info("Items without a match:")
                     st.dataframe(misses_df, use_container_width=True)
 
-                # Export
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                     (quote_df if not quote_df.empty else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Quote")
@@ -503,13 +618,13 @@ else:
             if not simple_up:
                 st.warning("Please upload a file.")
             else:
-                # Read file
+                # Read (preserve barcode digits)
                 try:
                     try:
-                        df_in = pd.read_excel(simple_up)
+                        df_in = pd.read_excel(simple_up, dtype=str)
                     except Exception:
                         simple_up.seek(0)
-                        df_in = pd.read_csv(simple_up)
+                        df_in = pd.read_csv(simple_up, dtype=str)
                 except Exception as e:
                     st.error(f"Could not read file: {e}")
                     st.stop()
@@ -519,36 +634,31 @@ else:
                 out_df = df_in.copy()
 
                 # Detect mapped columns (don’t alter originals)
-                name_col = name_hint if name_hint in df_in.columns else None
-                bc_col   = bc_hint   if bc_hint   in df_in.columns else None
-                sz_col   = size_hint if size_hint in df_in.columns else None
-                ts_col   = tst_hint  if tst_hint  in df_in.columns else None
-                q_col    = qty_hint  if qty_hint  in df_in.columns else None
+                cols_low = {str(c).strip().lower(): c for c in df_in.columns}
+                name_col = cols_low.get("name") or cols_low.get("product")
+                bc_col   = cols_low.get("barcode") or cols_low.get("bar code") or cols_low.get("ean") or cols_low.get("upc")
+                q_col    = cols_low.get("qty") or cols_low.get("quantity")
 
-                # Build a scratch view for matching only (not written out)
-                scratch = pd.DataFrame({
-                    "name":     df_in[name_col] if name_col else "",
-                    "barcode":  df_in[bc_col] if bc_col else "",
-                    "size_ml":  pd.to_numeric(df_in[sz_col], errors="coerce") if sz_col else None,
-                    "is_tester": (df_in[ts_col].astype(str).str.strip().str.lower().isin(["1","true","yes","y","t"])
-                                  if ts_col else None),
-                })
+                # Working copy with barcode_norm
+                df_work = df_in.copy()
+                if bc_col:
+                    df_work["barcode_norm"] = df_work[bc_col].apply(normalize_digits)
+                else:
+                    df_work["barcode_norm"] = ""
 
-                # Compute recommended for each row
+                # Compute recommended for each row using strict matcher
                 rec_prices = []
-                for i, r in scratch.iterrows():
-                    candidate = {
-                        "name":      r.get("name"),
-                        "barcode":   r.get("barcode"),
-                        "size_ml":   r.get("size_ml") if sz_col else None,
-                        "is_tester": bool(r.get("is_tester")) if ts_col else None,
+                for _, r in df_work.iterrows():
+                    row = {
+                        "name": str(r.get(name_col, "") if name_col else ""),
+                        "barcode": str(r.get(bc_col, "") if bc_col else ""),
+                        "barcode_norm": str(r.get("barcode_norm", "")),
                     }
-                    hit = match_one_strict(candidate)  # your existing matcher
-                    if hit is None or (hasattr(hit, "empty") and hit.empty):
-                        rec_prices.append(pd.NA)
+                    hit = match_one_strict(row)
+                    if hit and ("recommended_price" in hit):
+                        rec_prices.append(pd.to_numeric(hit["recommended_price"], errors="coerce"))
                     else:
-                        recf = pd.to_numeric(hit.get("recommended_price"), errors="coerce")
-                        rec_prices.append(float(recf) if pd.notna(recf) else pd.NA)
+                        rec_prices.append(pd.NA)
 
                 # Add recommended_price
                 out_df["recommended_price"] = rec_prices
