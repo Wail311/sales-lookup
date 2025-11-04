@@ -1,0 +1,35 @@
+# Tokens to remove during normalization (names-only matching)
+strip_tokens:
+  - "EAU DE PARFUM"
+  - "EAU DE TOILETTE"
+  - "EAU DE COLOGNE"
+  - "EAU DE"
+  - "EAU"
+  - "PARFUM"
+  - "EXTRAIT"
+  - "INTENSE"
+  - "ELIXIR"
+  - "FOR MEN"
+  - "FOR WOMEN"
+  - "POUR HOMME"
+  - "POUR FEMME"
+  - "MEN"
+  - "WOMEN"
+  - "UNISEX"
+  - "SPRAY"
+  - "VAPORISATEUR"
+
+# Optional brand aliases
+brand_aliases:
+  "YSL": "YVES SAINT LAURENT"
+  "D&G": "DOLCE & GABBANA"
+  "BVLGARI": "BULGARI"
+  "JPG": "JEAN PAUL GAULTIER"
+
+tester_tokens:
+  - TESTER
+  - tester
+  - Tester
+  - TESTEUR
+  - DEMONSTRATION
+  - DEMO

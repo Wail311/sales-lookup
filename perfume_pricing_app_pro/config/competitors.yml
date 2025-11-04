@@ -1,0 +1,32 @@
+# Pre-configured competitors (you can add more later).
+# For each competitor set:
+#   competitor_id: unique name shown in the app
+#   name_column:   column that contains the product name
+#   price_column:  column that contains the AED price
+#   sheet:         Excel sheet name (optional, process all if empty)
+#   detect_aed_header_in_sheet: true to scan first rows for a cell == "AED" and use that column
+#                               (useful when price column is not part of the header row)
+competitors:
+  - competitor_id: "PRICE LIST 08-01-2025"
+    file_hint: "PRICE LIST 08-01-2025.csv"
+    sheet: ""
+    name_column: "Unnamed: 1"
+    price_column: "AED"
+    barcode_column: "BARCODE"  # <-- put the actual header if present
+    detect_aed_header_in_sheet: true
+
+  - competitor_id: "AL HUDA & AL HIBA (04-01-2025)"
+    file_hint: "AL HUDA & AL HIBA STOCK LIST ULTIMATE (04-01-2025) .xlsx"
+    sheet: ""
+    name_column: "Unnamed: 2"
+    price_column: "AED"
+    barcode_column: ""         # leave empty if not available
+    detect_aed_header_in_sheet: true
+
+  - competitor_id: "EXPORT PRICE LIST 30.DEC.2024"
+    file_hint: "EXPORT PRICE LIST 30.DEC.2024.xlsx"
+    sheet: ""
+    name_column: "Unnamed: 3"
+    price_column: "Unnamed: 7"
+    barcode_column: ""         # update if you find it
+    detect_aed_header_in_sheet: false

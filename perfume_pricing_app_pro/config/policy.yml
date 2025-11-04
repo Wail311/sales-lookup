@@ -1,0 +1,31 @@
+# Matching & Pricing policy
+match_thresholds:
+  accept: 90            # rapidfuzz ratio >= accept
+  borderline_low: 86    # borderline_low <= ratio < accept
+
+ml_gate:
+  enforce: true         # Require ML equality
+
+tick_rule:              # Consistency rule (pairwise between competitor offers)
+  high_avg_threshold: 300     # AED
+  high_avg_within_pct: 0.20   # 20%
+  low_avg_within_abs: 50      # AED
+
+pricing:
+  strategy: "undercut_min_1pct"   # 1% below competitor minimum
+  default_min_margin_pct: 0.20
+  round_to: 1
+  outlier:
+    method: "iqr"
+    iqr_k: 1.5
+    stdev_k: 2.0
+
+barcode:
+  require_same_size_on_barcode: true
+  strict_for_offers: true      # <— if a competitor row has a barcode, do NOT fuzzy match it
+
+fuzzy:
+  require_numeric_token_overlap: true   # e.g., "46" must also appear on the stock name if present
+
+sanity:
+  cost_gap_warn_pct: 0.30      # 30% gap between cost and recommended should be flagged
